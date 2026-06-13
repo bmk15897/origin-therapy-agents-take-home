@@ -8,3 +8,5 @@ _internal/
 .env.*
 !.env.example
 *.log
+/issues/
+/docs/

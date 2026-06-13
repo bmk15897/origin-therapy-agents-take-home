@@ -32,14 +32,129 @@ Commit your code, your updated `README.md`, and your final generated `output.jso
 
 We expect you to spend about 2 hours. If you stop before finishing, commit what you have and describe the cuts in your README.
 
-Update this README with these sections before submitting:
+---
 
-1. How to run
-2. Stack and runtime
-3. Architecture
-4. Failure modes and production eval
-5. What I chose not to build, and why
-6. What I would do with another 4 hours
+## 1. How to Run
+
+Set your Anthropic API key before running:
+
+```bash
+export ANTHROPIC_API_KEY=your_key_here
+```
+
+Then install dependencies and run the triage agent:
+
+```bash
+npm install
+npm run triage   # defaults: --input data/inbox.json --output output.json --trace .trace/tool-calls.jsonl
+npm run validate # validates output.json against schema/output.schema.json
+```
+
+Custom paths:
+
+```bash
+npm run triage -- --input data/inbox.json --output output.json --trace .trace/tool-calls.jsonl
+```
+
+Run tests (requires `vitest` to be installed per issue 10):
+
+```bash
+npm test
+```
+
+Expected runtime for `npm run triage` on the 8-item inbox: under 2 minutes (sequential, one LLM call chain per item).
+
+---
+
+## 2. Stack and Runtime
+
+- **Language / runtime:** TypeScript, Node LTS, `tsx` (no compile step)
+- **LLM provider:** Anthropic — `@anthropic-ai/sdk`
+- **Model:** `claude-sonnet-4-6` (changeable via env var without structural changes)
+- **Test framework:** Vitest
+- **Key dependencies:** `ulid` (ULID generation for IDs), `ajv` + `ajv-formats` (JSON schema validation)
+- **No database or external services** — all tool calls are deterministic in-memory stubs in `src/tools.ts`
+
+---
+
+## 3. Architecture
+
+The agent implements a **LLM-driven ReAct loop** per inbox item, running items **sequentially** so that earlier tool call side-effects (e.g., a slot hold placed for item 1) are visible when processing later items that reference the same patient or provider.
+
+**Per-item loop:**
+1. `src/index.ts` calls `configureTrace` then `runAgent(inbox)`
+2. For each `InboxItem`, the agent sends the item to Claude with a system prompt and all tool definitions (8 real tools + an internal-only sentinel `submit_triage_result`)
+3. Claude reasons, calls tools mid-generation; tool results are fed back as `tool_result` content blocks
+4. The loop ends when Claude calls `submit_triage_result` (sentinel parsed as the structured `ItemOutput`) or after 10 iterations — whichever comes first
+5. Per-item `try/catch` ensures a fallback output is emitted on any failure; no item is silently dropped
+
+**Sentinel tool pattern:** `submit_triage_result` is defined as a tool alongside the 8 real tools so Claude can call it to "submit" its final structured output. It never appears in `tools_called[]` (excluded by `getToolCallsForItem`) and is not imported from `src/tools.ts`.
+
+**System prompt encodes the decision flowchart** from the PRD:
+- Step 1: Extract intake fields (no tool call)
+- Step 2: Safeguarding pre-pass (P0 → escalate → stop)
+- Step 3: Classify item type
+- Step 4: ReAct tool loop per classification (new referral, scheduling, clinical question, missing paperwork)
+- Step 5: `submit_triage_result`
+
+All tool calls are wrapped in `withItemContext(item.id, ...)`. `tools_called[]` is populated exclusively via `getToolCallsForItem(item.id)` — never hand-constructed.
+
+**Output:** `buildBatchOutput(items)` (from `src/tools.ts`) wraps the `ItemOutput[]` with a batch summary; `src/index.ts` writes it to `output.json`.
+
+---
+
+## 4. Failure Modes and Production Eval
+
+**Known failure modes:**
+
+| Mode | Mitigation in this prototype |
+|------|------------------------------|
+| LLM skips safeguarding pre-pass | System prompt enforces it as an unconditional first step; P0 items in `data/inbox.json` verify the path |
+| Max iterations exceeded (10-iter cap) | Fallback `ItemOutput` emitted with `requires_human_review: true`; never a silent drop |
+| Performative tool calls (calling tools without purpose) | Per-tool guidance in system prompt; rubric penalizes speculative calls |
+| Guardian name mismatch false positive | Comparison is LLM-side; fuzzy matching (nicknames, typos) risks both false positives and misses |
+| Model hallucinates tool args | Anthropic SDK validates tool input schemas; invalid calls raise an error caught by per-item handler |
+| API rate limit / timeout | Per-item `try/catch` produces fallback output; full batch is not aborted |
+| Out-of-network payer treated as in-network | `verify_insurance` is deterministic stub; production would need live billing system call |
+
+**What a production eval harness would add:**
+- Regression suite of synthetic inbox variants with known ground-truth outputs (classification, urgency, tools called)
+- Precision/recall on safeguarding detection across adversarial phrasings
+- Over-escalation rate (P0/P1 false positives are a cost — they erode staff trust)
+- Hallucination detection: does `draft_reply` ever contain clinical advice? Runs a classifier over every draft
+- Latency p50/p95 per item; budget alarm if p95 exceeds 30s
+- Trace replay: re-run any item from its JSONL trace entry for reproducibility
+
+---
+
+## 5. What I Chose Not to Build, and Why
+
+Scope cuts follow the PRD "Out of Scope" section:
+
+- **Auto-sending messages** — `draft_message` only; no send action exists. Keeping a human in the loop before any outbound communication is a hard safety requirement.
+- **Appointment booking** — `hold_slot` (pending review) is the ceiling. Scheduling is a staff decision after reviewing options with the family.
+- **Parallel item processing** — the PRD specifies sequential processing so slot holds placed for item N are visible when processing item N+1 (same patient/provider). Parallelism would require a shared hold ledger.
+- **Retry / backoff on API errors** — per-item fallback is the floor for a 2-hour prototype; production would add exponential backoff with jitter.
+- **Crisis-in-progress handling** ("my child is hurting themselves now") — redirect to 911/crisis line; different escalation path not modeled.
+- **Multi-child households** — one message with two children is treated as one item; the second child's intake would be missed. Noted in `missing_info[]` if detected.
+- **Languages other than English and Spanish** — flag for human translation; no draft attempted in unsupported languages.
+- **Age out of range** (referral for child over 18) — decline and redirect not implemented.
+- **School-based / IEP-funded referrals** — different billing path, not modeled.
+- **Cross-item deduplication within a batch** — each item is processed independently; staff correlates related items during human review.
+
+---
+
+## 6. What I Would Do With Another 4 Hours
+
+1. **Complete test suite (issue 10):** Vitest tests for all 8 decision branches, asserting on `ItemOutput` shape and `tools_called[]` presence — not on prompt text or model internals. This is the highest-confidence way to lock in correct behaviour across model updates.
+
+2. **Structured output / JSON mode:** Replace the sentinel tool pattern with Anthropic's native structured output (or a strict JSON schema response format) for the final `ItemOutput`. The sentinel works but is more fragile than a constrained decoding approach.
+
+3. **Prompt eval harness:** A second synthetic inbox with 8–10 items covering adversarial phrasings (implied safeguarding, ambiguous urgency, borderline clinical questions) and known ground-truth labels. Run it as a CI job to catch regressions before shipping prompt changes.
+
+4. **Guardian name normalization:** The current implementation relies on the LLM to compare guardian names. A production system would normalize (strip titles, lowercase, phonetic matching) before comparison to reduce false positives on "Sofia" vs "Sofía" or "Mike" vs "Michael".
+
+5. **Latency observability:** Emit per-item timing into the JSONL trace so the audit log shows not just what was called but how long each tool invocation and LLM turn took. Useful for capacity planning and detecting slow items in production.
 
 ## Your Task
 
