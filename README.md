@@ -77,7 +77,43 @@ Expected runtime for `npm run triage` on the 8-item inbox: under 2 minutes (sequ
 
 ---
 
-## 3. Architecture
+## 3. Problem Framing and Design Thinking
+
+### How we decomposed the problem
+
+The inbox is a batch of **heterogeneous items** — referrals, voicemails, portal messages, emails — that each require a different action chain. The core challenge is not just reading them but routing them correctly and safely, because a wrong classification has asymmetric costs: missing a safeguarding signal is catastrophic; over-routing a spam item is merely wasteful.
+
+We framed this as **ER triage**, not inbox automation. The goal is not to resolve items — it's to sort, prioritize, and prepare them for human action. This framing drove every key decision:
+
+### Key tensions we resolved
+
+**1. Safety before efficiency**
+
+The most important structural choice is the **safeguarding pre-pass** (Step 2) running unconditionally before classification (Step 3). A naive design would classify first and then check for urgency signals — but that risks a P0 disclosure being buried inside an otherwise routine-looking referral and not being escalated. We hard-coded the order: scan for harm signals first, always, before any other reasoning.
+
+**2. Automation ceiling**
+
+Every tool in the system deliberately stops short of irreversible action. `draft_message` creates a draft, not a send. `hold_slot` creates a pending hold, not a booking. `create_task` queues work for a human, not executes it. This was not an implementation shortcut — it reflects the domain constraint that a pediatric therapy practice should never auto-send clinical communications or auto-book appointments without staff review.
+
+**3. Structured output via tool call, not text parsing**
+
+We chose the **sentinel tool pattern** (`submit_triage_result` defined as a tool) rather than parsing the LLM's final text for structured output. This gives us schema-enforced structured extraction without post-processing fragility: Claude calls the tool with typed args, we parse the args directly into `ItemOutput`. The tradeoff is that it requires the sentinel to be excluded from the audit trace (it's an implementation detail, not an action).
+
+**4. Sequential processing over parallelism**
+
+Items are processed one at a time. The reason is state consistency: a slot hold placed during item 1's processing should be visible context when item 3 arrives for the same provider. Parallelising would require a shared ledger for holds and patient records — a reasonable next step, but adds complexity that isn't justified at prototype scale.
+
+**5. Classification as a hypothesis, not a gate**
+
+Classification (Step 3) is an initial hypothesis that the tool loop can revise. For example, an item that looks like a new referral at classification time may hit a guardian mismatch during `search_patient` and pivot to a different path. The flowchart is intentionally designed so that tool results can redirect the agent mid-loop, not just confirm a pre-committed decision.
+
+**6. Prompt encodes policy, not business logic**
+
+We encode the decision flowchart and urgency definitions verbatim in the system prompt rather than implementing them as code branches. This allows the model to handle the long-tail of phrasing variations (implied disclosures, partial Spanish, ambiguous urgency) that would require extensive case handling in code. The code enforces structural invariants (always `requires_human_review: true`, spam never gets a draft reply) but delegates judgment to the LLM.
+
+---
+
+## 4. Architecture
 
 The agent implements a **LLM-driven ReAct loop** per inbox item, running items **sequentially** so that earlier tool call side-effects (e.g., a slot hold placed for item 1) are visible when processing later items that reference the same patient or provider.
 
@@ -103,7 +139,7 @@ All tool calls are wrapped in `withItemContext(item.id, ...)`. `tools_called[]` 
 
 ---
 
-## 4. Failure Modes and Production Eval
+## 5. Failure Modes and Production Eval
 
 **Known failure modes:**
 
@@ -127,7 +163,7 @@ All tool calls are wrapped in `withItemContext(item.id, ...)`. `tools_called[]` 
 
 ---
 
-## 5. What I Chose Not to Build, and Why
+## 6. What I Chose Not to Build, and Why
 
 Scope cuts follow the PRD "Out of Scope" section:
 
@@ -144,7 +180,7 @@ Scope cuts follow the PRD "Out of Scope" section:
 
 ---
 
-## 6. What I Would Do With Another 4 Hours
+## 7. What I Would Do With Another 4 Hours
 
 1. **Complete test suite (issue 10):** Vitest tests for all 8 decision branches, asserting on `ItemOutput` shape and `tools_called[]` presence — not on prompt text or model internals. This is the highest-confidence way to lock in correct behaviour across model updates.
 
